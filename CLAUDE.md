@@ -114,10 +114,19 @@ still be mounted by the navigator? If yes, don't.**
 
 Expo Go dropped remote push support starting SDK 53 (dev-client/standalone
 only). Rather than build a remote push server this early, `portal_reminders`
-rows are meant to drive **locally scheduled** `expo-notifications`
-notifications computed on-device (no cron, no server fan-out) — this is
-simpler, works fully in Expo Go, and is enough for personal reminders. Not yet
-implemented (task pending). If remote push is wanted later, note
+rows drive **locally scheduled** `expo-notifications` notifications computed
+on-device (no cron, no server fan-out) — this is simpler, works fully in Expo
+Go, and is enough for personal reminders. Implemented in
+`src/lib/notifications.ts`: `syncReminderNotifications()` cancels everything
+it previously scheduled (tracked by an `identifier` prefix) and reschedules
+one `WEEKLY` trigger per (reminder × selected day-of-week) from scratch —
+called from `(app)/settings.tsx` after every reminder create/update/toggle/
+delete, and once when push permission is first granted. **Simplification**:
+fires exactly at `remind_time` with a single "It's time to pray" notification
+— no separate "approaching" pre-alert like the web app's cron job (that would
+need a second scheduled entry per day with a lead-minutes-shifted time,
+including midnight-rollover handling — not worth the complexity for local
+scheduling). If remote push is wanted later, note
 `portal_push_subscriptions`'s schema (endpoint/p256dh/auth) is a *Web Push*
 shape and doesn't map to Expo push tokens — that'd need its own table/column,
 not a reuse of the web app's table.
@@ -169,25 +178,61 @@ implementation later without touching call sites.
 
 ## Verified working end-to-end (2026-07-06, via chrome-devtools against the live DB)
 
-- Dev-login signup → Supabase auth (email confirmation required, confirmed via
+All 6 tabs are built and were exercised live against the real `fsqpjdsvlvimbshacmqt`
+project (not mocked) using a `martintest01` dev-login test account:
+
+- **Auth**: dev-login signup (email confirmation required, confirmed via
   admin API for the test account) → profile auto-created by the
-  `portal_handle_new_user` trigger.
-- Dev-login sign-in → session persisted across reload (AsyncStorage) →
-  dashboard loads real (empty) stats/plans/requests.
-- Categories: create (with preset auto-fill + color picker) → persists to
-  `portal_categories` → renders in the grid with live count.
-- Tab navigation across all 6 tabs.
+  `portal_handle_new_user` trigger; sign-in → session persists across reload
+  (AsyncStorage); `Stack.Protected` gate confirmed non-looping.
+- **Dashboard**: real stats tiles, plan chips with live progress, quick-log —
+  all update correctly after logging a prayer.
+- **Categories**: create (preset auto-fill + color picker) → persists →
+  renders with live request count; edit/delete icons present.
+- **Requests**: create (category picker + title/details) → navigates to
+  detail; quick-log ("I prayed for this today") persists a
+  `portal_prayer_logs` row and updates the session/history count live; status
+  chips (active/answered/archived), scripture add form present.
+- **Plans**: create (target-type toggle, frequency, times-per-period
+  stepper, day picker, time-window switch) → progress bars and the
+  today/week counter reflect real `computePlanProgress()` output immediately
+  (verified: a plan targeting an already-logged-today request showed "1/1 ✓"
+  and "30d: 100%" without a manual refresh trick).
+- **Analytics**: stat tiles, sessions-over-time bar chart, sessions-by-category
+  and most-prayed-for horizontal bars, plan adherence, lagging-areas — all
+  populated from the same real data.
+- **Settings**: profile/timezone/SMS fields save; reminder create (day
+  picker defaulting to all 7, linked-prayer-point picker) persists and
+  displays correctly ("Every day · heads-up 15 min before").
 
-## What's left (see TaskList in-session, or just grep the repo for stubs)
+Not yet exercised live (would need a real device or a configured Google OAuth
+redirect): `signInWithGoogle()`, actual notification delivery (scheduling
+code runs, but firing was not observed — would need to wait real-world
+minutes/days on a device), AI scripture suggestions, voice-note recording,
+SMS reminders.
 
-`(app)/requests/index.tsx`, `(app)/requests/[id].tsx`, `(app)/plans.tsx`,
-`(app)/analytics.tsx` are `<ComingSoon>` stubs. `(app)/settings.tsx` has only
-profile display + sign-out, missing reminders CRUD and the notifications
-card. None of the AI-suggestions/voice-transcription/SMS-reminder features
-(which live behind Next.js API routes in the web app, not raw Supabase — see
-PORTAL_SPEC.md §5-6) are wired up yet; they need `EXPO_PUBLIC_PORTAL_API_URL`
-pointed at a reachable instance of the Next.js server, which isn't currently
-deployed anywhere reachable from a phone (only `localhost:3000` in dev).
-Haptics/animations exist on Dashboard and Categories; not yet passed over the
-remaining screens once built. EAS build config (`eas.json`) doesn't exist yet
-— needed before a real device/store build.
+## What's left
+
+- **Google OAuth redirect URI** needs registering in the Supabase dashboard
+  (see above) before `signInWithGoogle()` can complete — needs owner access
+  to the Supabase project, which this session didn't have.
+- **AI suggestions / voice transcription / SMS reminders** — all three live
+  behind Next.js API routes in the web app (see PORTAL_SPEC.md §5-6), not raw
+  Supabase, so they need `EXPO_PUBLIC_PORTAL_API_URL` pointed at a reachable
+  deployment of that server (currently only `localhost:3000` in dev, not
+  reachable from a phone). Request detail screen has no AI-suggestions panel
+  or voice recorder yet — scriptures can only be added manually for now.
+- **EAS build config** (`eas.json`) doesn't exist yet — needed before a real
+  device/store build. No app icons/splash beyond the create-expo-app
+  defaults — swap `assets/images/*` for real PrayerBook branding before
+  shipping.
+- **Confetti** is haptic-only (see `lib/portal/confetti.ts`) — a real
+  particle burst would need a small canvas/SVG-based implementation (no
+  direct RN equivalent to `canvas-confetti`).
+- Chart x-axis labels on Analytics' 30/90-day views are cramped (every day
+  gets a tiny label) — consider showing every Nth label instead of all of
+  them.
+- Test data exists in the shared `fsqpjdsvlvimbshacmqt` DB from this session's
+  verification pass: user `martintest01` / category "Academics" / request
+  "Peace during finals week" / plan "Daily peace" / reminder "Morning
+  devotion". Harmless to leave or clean up.

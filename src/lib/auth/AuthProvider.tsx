@@ -5,6 +5,7 @@ import { Platform } from "react-native";
 import { createContext, useContext, useEffect, useMemo, useState } from "react";
 
 import { supabase } from "../supabase/client";
+import { registerSyncTriggers, runSync } from "../db/sync";
 import { getProfile } from "../portal/queries";
 import { createProfile } from "../portal/mutations";
 import type { Profile } from "../portal/types";
@@ -36,9 +37,21 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [profile, setProfile] = useState<Profile | null>(null);
   const [loading, setLoading] = useState(true);
 
+  // Local-first with a network fallback: returning users on a device that
+  // already has data get an instant profile from SQLite with no network
+  // wait. A brand-new install (or a different device) has nothing locally
+  // yet, so — only in that case — we block on one sync cycle to pull the
+  // existing profile down before concluding the user needs onboarding.
+  // Also (re-)registers the background sync triggers (foreground/
+  // reconnect/periodic) every time a session is confirmed.
   async function loadProfile(userId: string) {
-    const p = await getProfile(userId);
+    let p = getProfile(userId);
+    if (!p) {
+      await runSync(userId);
+      p = getProfile(userId);
+    }
     setProfile(p);
+    registerSyncTriggers(userId);
   }
 
   useEffect(() => {
@@ -125,9 +138,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         // row when raw_user_meta_data has a `username` key — but if email
         // confirmation is required there's no session yet to retry against,
         // and if the trigger's insert ever loses a race (case-insensitive
-        // uniqueness), fall back to an explicit insert.
+        // uniqueness), fall back to an explicit insert. Sync first so the
+        // "does it exist" check is against the remote truth, not the (as
+        // yet unsynced) local DB — otherwise this always looks like a
+        // fresh profile and re-inserts into a row the trigger already made.
         if (data.user && data.session) {
-          const existing = await getProfile(data.user.id);
+          await runSync(data.user.id);
+          const existing = getProfile(data.user.id);
           if (!existing) {
             const result = await createProfile(data.user.id, email, username);
             if ("error" in result) return { error: result.error };

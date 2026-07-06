@@ -33,18 +33,18 @@ export default function CategoriesScreen() {
   const [editing, setEditing] = useState<CategoryWithCount | null | "new">(null);
   const [deleting, setDeleting] = useState<CategoryWithCount | null>(null);
 
-  const load = useCallback(async () => {
-    const data = await getCategoriesWithCount();
-    setCategories(data);
-  }, []);
+  const load = useCallback(() => {
+    if (!user) return;
+    setCategories(getCategoriesWithCount(user.id));
+  }, [user]);
 
   useEffect(() => {
     load();
   }, [load]);
 
-  async function handleDelete() {
-    if (!deleting) return;
-    const result = await deleteCategory(deleting.id);
+  function handleDelete() {
+    if (!deleting || !user) return;
+    const result = deleteCategory(user.id, deleting.id);
     if ("error" in result) {
       showToast(result.error, "error");
       return;
@@ -194,13 +194,13 @@ function CategoryEditor({
     (p) => !existingNames.includes(p.name.toLowerCase()),
   );
 
-  async function handleSave() {
+  function handleSave() {
     if (!name.trim()) return;
     setSaving(true);
     const input = { name: name.trim(), description: description.trim() || undefined, color };
     const result = editing
-      ? await updateCategory(editing.id, input)
-      : await createCategory(userId, input);
+      ? updateCategory(userId, editing.id, input)
+      : createCategory(userId, input);
     setSaving(false);
     if ("error" in result) {
       showToast(result.error, "error");

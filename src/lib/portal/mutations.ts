@@ -1,11 +1,27 @@
-import { format } from "date-fns";
-
+import {
+  categoryStore,
+  logStore,
+  planStore,
+  profileStore,
+  reminderStore,
+  requestStore,
+  scriptureStore,
+} from "../db/local-store";
+import { runSync } from "../db/sync";
 import { supabase } from "../supabase/client";
 import { normalizeGhanaPhone, usernameSchema } from "./validation";
 
 export type ActionResult = { error: string } | { ok: true };
 
+/** Fire-and-forget: push this device's change immediately if online, silently no-op if not. */
+function syncSoon(userId: string) {
+  void runSync(userId);
+}
+
 // ---------------------------------------------------------------- profile --
+// Account creation and username uniqueness inherently require the network —
+// unlike everything else in this file, these two still talk to Supabase
+// directly rather than going through the local-first path.
 
 export async function createProfile(
   userId: string,
@@ -17,10 +33,6 @@ export async function createProfile(
     return { error: parsed.error.issues[0]?.message ?? "Invalid username" };
   }
 
-  // No admin client on the mobile app — RLS forbids reading other users'
-  // profiles, so the live pre-check the web app does via a service-role
-  // client isn't available here. We rely on the DB's unique index and
-  // surface its violation with the same friendly message.
   const { error } = await supabase
     .from("portal_profiles")
     .insert({ id: userId, username: parsed.data, email });
@@ -29,12 +41,13 @@ export async function createProfile(
     if (error.code === "23505") return { error: "That username is already taken" };
     return { error: "Could not create your profile" };
   }
+  syncSoon(userId);
   return { ok: true };
 }
 
 export async function checkUsernameAvailable(username: string): Promise<boolean | null> {
   const parsed = usernameSchema.safeParse(username);
-  if (!parsed.success) return null; // invalid, not a network result
+  if (!parsed.success) return null;
   const { data } = await supabase
     .from("portal_profiles")
     .select("id")
@@ -43,10 +56,10 @@ export async function checkUsernameAvailable(username: string): Promise<boolean 
   return !data;
 }
 
-export async function updateProfile(
+export function updateProfile(
   userId: string,
   input: { timezone: string; phone?: string; smsOptIn: boolean },
-): Promise<ActionResult> {
+): ActionResult {
   let phone: string | null = null;
   if (input.phone) {
     phone = normalizeGhanaPhone(input.phone);
@@ -57,13 +70,8 @@ export async function updateProfile(
   if (input.smsOptIn && !phone) {
     return { error: "Add a phone number to enable SMS reminders" };
   }
-
-  const { error } = await supabase
-    .from("portal_profiles")
-    .update({ timezone: input.timezone, phone, sms_opt_in: input.smsOptIn })
-    .eq("id", userId);
-
-  if (error) return { error: "Could not save settings" };
+  profileStore.update(userId, { timezone: input.timezone, phone, smsOptIn: input.smsOptIn });
+  syncSoon(userId);
   return { ok: true };
 }
 
@@ -75,39 +83,39 @@ export interface CategoryInput {
   color?: string;
 }
 
-export async function createCategory(userId: string, input: CategoryInput): Promise<ActionResult> {
-  const { error } = await supabase.from("portal_categories").insert({
-    user_id: userId,
-    name: input.name,
-    description: input.description || null,
-    color: input.color || null,
-  });
-  if (error) {
-    if (error.code === "23505") return { error: "You already have a category with that name" };
-    return { error: "Could not create category" };
+// Local unique index (schema.ts) throws synchronously on a duplicate name —
+// catching it here means the user sees the same friendly message the web
+// app's server action produces, instantly, instead of the write silently
+// failing forever during a later background push.
+function isDuplicateNameError(err: unknown): boolean {
+  return err instanceof Error && /UNIQUE constraint failed/i.test(err.message);
+}
+
+export function createCategory(userId: string, input: CategoryInput): ActionResult {
+  try {
+    categoryStore.create(userId, input);
+  } catch (err) {
+    if (isDuplicateNameError(err)) return { error: "You already have a category with that name" };
+    throw err;
   }
+  syncSoon(userId);
   return { ok: true };
 }
 
-export async function updateCategory(id: string, input: CategoryInput): Promise<ActionResult> {
-  const { error } = await supabase
-    .from("portal_categories")
-    .update({
-      name: input.name,
-      description: input.description || null,
-      color: input.color || null,
-    })
-    .eq("id", id);
-  if (error) {
-    if (error.code === "23505") return { error: "You already have a category with that name" };
-    return { error: "Could not update category" };
+export function updateCategory(userId: string, id: string, input: CategoryInput): ActionResult {
+  try {
+    categoryStore.update(id, input);
+  } catch (err) {
+    if (isDuplicateNameError(err)) return { error: "You already have a category with that name" };
+    throw err;
   }
+  syncSoon(userId);
   return { ok: true };
 }
 
-export async function deleteCategory(id: string): Promise<ActionResult> {
-  const { error } = await supabase.from("portal_categories").delete().eq("id", id);
-  if (error) return { error: "Could not delete category" };
+export function deleteCategory(userId: string, id: string): ActionResult {
+  categoryStore.softDelete(id);
+  syncSoon(userId);
   return { ok: true };
 }
 
@@ -120,69 +128,35 @@ export interface RequestInput {
   voiceNotePath?: string;
 }
 
-export async function createRequest(
-  userId: string,
-  input: RequestInput,
-): Promise<ActionResult & { id?: string }> {
-  const { data, error } = await supabase
-    .from("portal_prayer_requests")
-    .insert({
-      user_id: userId,
-      category_id: input.categoryId,
-      title: input.title,
-      details: input.details || null,
-      voice_note_path: input.voiceNotePath || null,
-    })
-    .select("id")
-    .single();
-  if (error) return { error: "Could not create prayer point" };
-  return { ok: true, id: data.id };
+export function createRequest(userId: string, input: RequestInput): ActionResult & { id?: string } {
+  const request = requestStore.create(userId, input);
+  syncSoon(userId);
+  return { ok: true, id: request.id };
 }
 
-export async function updateRequest(
+export function updateRequest(
+  userId: string,
   id: string,
   input: { categoryId: string; title: string; details?: string },
-): Promise<ActionResult> {
-  const { error } = await supabase
-    .from("portal_prayer_requests")
-    .update({
-      category_id: input.categoryId,
-      title: input.title,
-      details: input.details || null,
-    })
-    .eq("id", id);
-  if (error) return { error: "Could not update prayer point" };
+): ActionResult {
+  requestStore.update(id, input);
+  syncSoon(userId);
   return { ok: true };
 }
 
-export async function setRequestStatus(
+export function setRequestStatus(
+  userId: string,
   id: string,
   status: "active" | "answered" | "archived",
-): Promise<ActionResult> {
-  const { error } = await supabase
-    .from("portal_prayer_requests")
-    .update({
-      status,
-      answered_at: status === "answered" ? new Date().toISOString() : null,
-    })
-    .eq("id", id);
-  if (error) return { error: "Could not update status" };
+): ActionResult {
+  requestStore.setStatus(id, status);
+  syncSoon(userId);
   return { ok: true };
 }
 
-export async function deleteRequest(id: string): Promise<ActionResult> {
-  const { data: existing } = await supabase
-    .from("portal_prayer_requests")
-    .select("voice_note_path")
-    .eq("id", id)
-    .maybeSingle();
-
-  const { error } = await supabase.from("portal_prayer_requests").delete().eq("id", id);
-  if (error) return { error: "Could not delete prayer point" };
-
-  if (existing?.voice_note_path) {
-    await supabase.storage.from("portal-voice-notes").remove([existing.voice_note_path]);
-  }
+export function deleteRequest(userId: string, id: string): ActionResult {
+  requestStore.softDelete(id);
+  syncSoon(userId);
   return { ok: true };
 }
 
@@ -197,47 +171,19 @@ export interface LogInput {
   voiceNotePath?: string;
 }
 
-/**
- * Direct write — always stamps time at call, matching the web app's
- * logPrayer() wrapper semantics. See queueLogPrayer() in offline-queue.ts
- * for the offline-aware entry point every screen should actually call.
- */
-export async function logPrayerAction(userId: string, input: LogInput): Promise<ActionResult> {
-  const { error } = await supabase.from("portal_prayer_logs").insert({
-    user_id: userId,
-    request_id: input.requestId,
-    ...(input.prayedOn ? { prayed_on: input.prayedOn } : {}),
-    prayed_at: input.prayedAt || null,
-    duration_minutes: input.durationMinutes ?? null,
-    note: input.note || null,
-    voice_note_path: input.voiceNotePath || null,
-  });
-  if (error) return { error: "Could not log your prayer" };
+/** Always stamps time at call — "so an offline log syncs with the moment it actually happened." */
+export function logPrayer(userId: string, input: LogInput): ActionResult {
+  const now = new Date();
+  const prayedOn = input.prayedOn ?? now.toISOString().slice(0, 10);
+  const prayedAt = input.prayedAt ?? now.toTimeString().slice(0, 5);
+  logStore.create(userId, { ...input, prayedOn, prayedAt });
+  syncSoon(userId);
   return { ok: true };
 }
 
-export function stampLogInput(input: LogInput): LogInput {
-  const now = new Date();
-  return {
-    ...input,
-    prayedOn: input.prayedOn ?? format(now, "yyyy-MM-dd"),
-    prayedAt: input.prayedAt ?? format(now, "HH:mm"),
-  };
-}
-
-export async function deleteLog(id: string): Promise<ActionResult> {
-  const { data: existing } = await supabase
-    .from("portal_prayer_logs")
-    .select("voice_note_path")
-    .eq("id", id)
-    .maybeSingle();
-
-  const { error } = await supabase.from("portal_prayer_logs").delete().eq("id", id);
-  if (error) return { error: "Could not delete log entry" };
-
-  if (existing?.voice_note_path) {
-    await supabase.storage.from("portal-voice-notes").remove([existing.voice_note_path]);
-  }
+export function deleteLog(userId: string, id: string): ActionResult {
+  logStore.softDelete(id);
+  syncSoon(userId);
   return { ok: true };
 }
 
@@ -255,49 +201,27 @@ export interface PlanInput {
   endDate?: string;
 }
 
-function planToRow(input: PlanInput) {
-  return {
-    title: input.title,
-    request_id: input.requestId ?? null,
-    category_id: input.categoryId ?? null,
-    frequency: input.frequency,
-    days_of_week:
-      input.daysOfWeek && input.daysOfWeek.length > 0 && input.daysOfWeek.length < 7
-        ? input.daysOfWeek
-        : null,
-    times_per_period: input.timesPerPeriod,
-    window_start: input.windowStart ?? null,
-    window_end: input.windowEnd ?? null,
-    end_date: input.endDate ?? null,
-  };
-}
-
-export async function createPlan(userId: string, input: PlanInput): Promise<ActionResult> {
-  const { error } = await supabase
-    .from("portal_prayer_plans")
-    .insert({ ...planToRow(input), user_id: userId });
-  if (error) return { error: "Could not create plan" };
+export function createPlan(userId: string, input: PlanInput): ActionResult {
+  planStore.create(userId, input);
+  syncSoon(userId);
   return { ok: true };
 }
 
-export async function updatePlan(id: string, input: PlanInput): Promise<ActionResult> {
-  const { error } = await supabase.from("portal_prayer_plans").update(planToRow(input)).eq("id", id);
-  if (error) return { error: "Could not update plan" };
+export function updatePlan(userId: string, id: string, input: PlanInput): ActionResult {
+  planStore.update(id, input);
+  syncSoon(userId);
   return { ok: true };
 }
 
-export async function togglePlan(id: string, isActive: boolean): Promise<ActionResult> {
-  const { error } = await supabase
-    .from("portal_prayer_plans")
-    .update({ is_active: isActive })
-    .eq("id", id);
-  if (error) return { error: "Could not update plan" };
+export function togglePlan(userId: string, id: string, isActive: boolean): ActionResult {
+  planStore.toggle(id, isActive);
+  syncSoon(userId);
   return { ok: true };
 }
 
-export async function deletePlan(id: string): Promise<ActionResult> {
-  const { error } = await supabase.from("portal_prayer_plans").delete().eq("id", id);
-  if (error) return { error: "Could not delete plan" };
+export function deletePlan(userId: string, id: string): ActionResult {
+  planStore.softDelete(id);
+  syncSoon(userId);
   return { ok: true };
 }
 
@@ -311,42 +235,27 @@ export interface ReminderInput {
   requestId?: string;
 }
 
-function reminderToRow(input: ReminderInput) {
-  return {
-    label: input.label,
-    remind_time: input.remindTime,
-    days_of_week: [...input.daysOfWeek].sort(),
-    lead_minutes: input.leadMinutes,
-    request_id: input.requestId ?? null,
-  };
-}
-
-export async function createReminder(userId: string, input: ReminderInput): Promise<ActionResult> {
-  const { error } = await supabase
-    .from("portal_reminders")
-    .insert({ ...reminderToRow(input), user_id: userId });
-  if (error) return { error: "Could not create reminder" };
+export function createReminder(userId: string, input: ReminderInput): ActionResult {
+  reminderStore.create(userId, input);
+  syncSoon(userId);
   return { ok: true };
 }
 
-export async function updateReminder(id: string, input: ReminderInput): Promise<ActionResult> {
-  const { error } = await supabase.from("portal_reminders").update(reminderToRow(input)).eq("id", id);
-  if (error) return { error: "Could not update reminder" };
+export function updateReminder(userId: string, id: string, input: ReminderInput): ActionResult {
+  reminderStore.update(id, input);
+  syncSoon(userId);
   return { ok: true };
 }
 
-export async function toggleReminder(id: string, isActive: boolean): Promise<ActionResult> {
-  const { error } = await supabase
-    .from("portal_reminders")
-    .update({ is_active: isActive })
-    .eq("id", id);
-  if (error) return { error: "Could not update reminder" };
+export function toggleReminder(userId: string, id: string, isActive: boolean): ActionResult {
+  reminderStore.toggle(id, isActive);
+  syncSoon(userId);
   return { ok: true };
 }
 
-export async function deleteReminder(id: string): Promise<ActionResult> {
-  const { error } = await supabase.from("portal_reminders").delete().eq("id", id);
-  if (error) return { error: "Could not delete reminder" };
+export function deleteReminder(userId: string, id: string): ActionResult {
+  reminderStore.softDelete(id);
+  syncSoon(userId);
   return { ok: true };
 }
 
@@ -360,39 +269,20 @@ export interface ScriptureEntry {
   source?: "manual" | "ai";
 }
 
-export async function addScriptures(
-  userId: string,
-  requestId: string,
-  entries: ScriptureEntry[],
-): Promise<ActionResult> {
-  const { count } = await supabase
-    .from("portal_scriptures")
-    .select("id", { count: "exact", head: true })
-    .eq("request_id", requestId);
-
-  const existing = count ?? 0;
+export function addScriptures(userId: string, requestId: string, entries: ScriptureEntry[]): ActionResult {
+  const existing = scriptureStore.count(requestId);
   if (existing + entries.length > MAX_SCRIPTURES_PER_REQUEST) {
     return {
       error: `A prayer point can hold up to ${MAX_SCRIPTURES_PER_REQUEST} scriptures (you have ${existing})`,
     };
   }
-
-  const rows = entries.map((entry, i) => ({
-    user_id: userId,
-    request_id: requestId,
-    content: entry.content,
-    reference: entry.reference || null,
-    source: entry.source ?? "manual",
-    position: existing + i,
-  }));
-
-  const { error } = await supabase.from("portal_scriptures").insert(rows);
-  if (error) return { error: "Could not add scripture" };
+  scriptureStore.createMany(userId, requestId, entries);
+  syncSoon(userId);
   return { ok: true };
 }
 
-export async function deleteScripture(id: string): Promise<ActionResult> {
-  const { error } = await supabase.from("portal_scriptures").delete().eq("id", id);
-  if (error) return { error: "Could not remove scripture" };
+export function deleteScripture(userId: string, id: string): ActionResult {
+  scriptureStore.softDelete(id);
+  syncSoon(userId);
   return { ok: true };
 }

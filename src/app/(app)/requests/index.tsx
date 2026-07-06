@@ -41,10 +41,10 @@ export default function RequestsScreen() {
   const [categoryFilter, setCategoryFilter] = useState<string>(params.category ?? "all");
   const [creating, setCreating] = useState(false);
 
-  const load = useCallback(async () => {
-    const result = await getRequestsList();
-    setData(result);
-  }, []);
+  const load = useCallback(() => {
+    if (!user) return;
+    setData(getRequestsList(user.id));
+  }, [user]);
 
   useEffect(() => {
     load();
@@ -249,10 +249,10 @@ function CreateRequestSheet({
     }
   }, [visible, defaultCategoryId, categories]);
 
-  async function handleSave() {
+  function handleSave() {
     if (!title.trim() || !categoryId) return;
     setSaving(true);
-    const result = await createRequest(userId, {
+    const result = createRequest(userId, {
       categoryId,
       title: title.trim(),
       details: details.trim() || undefined,

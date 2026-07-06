@@ -11,6 +11,7 @@ import { Pill } from "@/components/ui/Pill";
 import { PressableScale } from "@/components/ui/PressableScale";
 import { describePlan } from "@/lib/portal/describe-plan";
 import { ProgressBar } from "@/components/ui/ProgressBar";
+import { useAuth } from "@/lib/auth/AuthProvider";
 import { daysSince } from "@/lib/portal/progress";
 import { getAnalyticsData, type AnalyticsData } from "@/lib/portal/queries";
 import { colors, neglectColor, radius, spacing, typography } from "@/theme/tokens";
@@ -18,12 +19,13 @@ import { colors, neglectColor, radius, spacing, typography } from "@/theme/token
 const RANGES = [7, 30, 90] as const;
 
 export default function AnalyticsScreen() {
+  const { user } = useAuth();
   const [data, setData] = useState<AnalyticsData | null>(null);
   const [range, setRange] = useState<(typeof RANGES)[number]>(30);
 
   useEffect(() => {
-    getAnalyticsData().then(setData);
-  }, []);
+    if (user) setData(getAnalyticsData(user.id));
+  }, [user]);
 
   const inRange = useMemo(() => {
     if (!data) return [];

@@ -61,12 +61,15 @@ Implementation (`src/lib/auth/AuthProvider.tsx`):
   (`(auth)/signup.tsx`, reachable only via the dev-login section's "Create a
   dev test account" link, not linked from the primary login UI).
 
-**Not yet done / needs dashboard access I don't have**: the Google OAuth
-redirect URI for this Expo app (`Linking.createURL('auth/callback')` — differs
-per environment: `exp://...` in Expo Go, `prayerbook://...` in a standalone/dev
-build) must be added to the Supabase project's Auth → URL Configuration →
-Redirect URLs allow-list before `signInWithGoogle()` will actually complete.
-Untested end-to-end for that reason. Email/password dev login **is** verified
+**Not yet done**: the Google OAuth redirect URI for this Expo app
+(`Linking.createURL('auth/callback')` — differs per environment: `exp://...`
+in Expo Go, `prayerbook://...` in a standalone/dev build) must be added to the
+Supabase project's Auth → URL Configuration → Redirect URLs allow-list before
+`signInWithGoogle()` will actually complete. The user started authorizing the
+`plugin:supabase:supabase` MCP server (OAuth flow) so a future session can
+configure this directly via the Management API — check whether that
+completed (`mcp__plugin_supabase_supabase__*` tools present and authenticated)
+before assuming it still needs doing. Email/password dev login **is** verified
 working end-to-end against the live DB (see "Verified working" below).
 
 ### Supabase requires email confirmation
@@ -131,14 +134,125 @@ scheduling). If remote push is wanted later, note
 shape and doesn't map to Expo push tokens — that'd need its own table/column,
 not a reuse of the web app's table.
 
-## Offline queue
+## Offline-first architecture (SQLite + sync engine)
 
-`src/lib/portal/offline-queue.ts` ports the web app's `log-queue.ts` semantics
-exactly (see PORTAL_SPEC.md §9): stamp time at tap not at sync, AsyncStorage
-instead of IndexedDB, `@react-native-community/netinfo` instead of
-`navigator.onLine`, FIFO single-flight flush, drop-on-validation-error,
-stop-on-network-error. Always call `queueLogPrayer()`, never
-`logPrayerAction()` directly, from UI code.
+The user explicitly asked for offline-first, not just an offline queue for
+one table: **every screen reads from local SQLite, never the network
+directly.** A background sync engine is what keeps SQLite eventually
+consistent with Supabase. This superseded an earlier `offline-queue.ts` that
+only handled prayer logs via AsyncStorage — that file is gone; the same
+"stamp time at tap, not at sync" idea now applies to every table via the
+general mechanism below.
+
+**Why SQLite, not WatermelonDB**: WatermelonDB needs a custom dev client
+(JSI native module) and does not run in Expo Go — that directly conflicts
+with this project's hard requirement (user: "use expo sdk 54 so i can test
+with the current expo app on playstore"). `expo-sqlite` is a first-party
+Expo module bundled into Expo Go, with a synchronous API
+(`openDatabaseSync`/`runSync`/`getAllSync`/`getFirstSync`) fast enough that
+local reads don't need loading states at all — which is also what makes the
+app "super responsive" as asked for, not just usable offline.
+
+**Layout**:
+- `src/lib/db/schema.ts` — `CREATE TABLE` DDL for a local mirror of
+  `portal_categories`, `portal_prayer_requests`, `portal_scriptures`,
+  `portal_prayer_logs`, `portal_prayer_plans`, `portal_reminders`, and
+  `portal_profiles` (one row). Deliberately **not** mirrored:
+  `portal_reminder_sends`, `portal_push_subscriptions` — server/cron-only,
+  never written from the client. Every mirrored table gets `_dirty` (has
+  local changes not yet pushed) and `_deleted` (soft-delete tombstone, kept
+  until the delete is pushed, then hard-removed) on top of the remote
+  columns. `days_of_week` (`int[]` remotely) is stored as JSON text — SQLite
+  has no array type.
+- `src/lib/db/client.ts` — the `SQLiteDatabase` singleton (`prayerbook.db`),
+  runs the schema DDL once on first access.
+- `src/lib/db/local-store.ts` — one `*Store` object per table
+  (`categoryStore`, `requestStore`, etc.) with typed CRUD functions that are
+  the **only** thing `queries.ts`/`mutations.ts` touch. Handles the
+  int↔boolean and JSON↔array conversions and the local cascade-delete
+  emulation (category delete → its requests → their scriptures/logs, and any
+  plan/reminder targeting them — mirroring the remote `ON DELETE CASCADE`
+  rules in the migration SQL cited in PORTAL_SPEC.md §2, since SQLite has no
+  FK relationship to the remote schema to enforce this automatically).
+- `src/lib/db/sync.ts` — the push/pull engine. **Full-snapshot pull**, not an
+  incremental `updated_at > cursor` design — chosen because the remote
+  tables have no soft-delete column, so an incremental pull could never
+  learn a row was deleted remotely; a full per-table snapshot (`select *
+  where user_id = X`) naturally reconciles deletes via `deleteIdsNotIn`. This
+  is only reasonable because per-table row counts are small (a personal
+  prayer log, not a multi-tenant dataset) — revisit if that assumption ever
+  stops holding. Conflict resolution is **dirty-flag-wins**, not
+  timestamp-based: a locally-dirty row is never overwritten by a pull no
+  matter how recent the remote version, since every row is single-owner
+  (RLS-scoped to one `auth.uid()`) and this app doesn't attempt real-time
+  multi-device merge. Push runs in FK-dependency order (profile → categories
+  → requests → scriptures/logs/plans/reminders in parallel).
+- **IDs are client-generated** (`crypto.randomUUID()`) at creation time, not
+  server defaults — essential for offline-first, since a row created while
+  offline must be immediately usable (e.g., navigating straight to its detail
+  screen) without waiting for a server round trip to learn its ID.
+- **Sync triggers** (`registerSyncTriggers`, called once from
+  `AuthProvider.loadProfile`): `AppState` foreground, `NetInfo` reconnect, a
+  5-minute interval, and once immediately on login.
+- **Mutations are fire-and-forget**: every function in `mutations.ts` writes
+  to SQLite synchronously, marks the row dirty, and calls a non-awaited
+  `runSync(userId)` — the caller gets `{ok: true}` back instantly regardless
+  of connectivity; `runSync` itself no-ops immediately if `NetInfo` reports
+  offline.
+
+**Known limitation / what to check before trusting this further**: this was
+built and typechecks cleanly, but **could not be exercised at runtime this
+session** — `expo-sqlite`'s web backend needs a Web Worker that imports a
+`.wasm` binary, and Metro fails to resolve that import even with
+`resolver.assetExts` including `wasm` (see `metro.config.js` — the
+`Cross-Origin-Opener-Policy`/`Cross-Origin-Embedder-Policy` headers there are
+correct and necessary but insufficient; the wasm-in-worker resolution itself
+is the blocker, likely because Expo web bundles `Worker()` targets as a
+separate graph that doesn't inherit the main resolver config). This sandbox
+also had no Android emulator (`emulator` binary missing) and no Mac for an
+iOS simulator, so there was no way to test the real native SQLite binding
+either. **First thing a future session with device access should do**: run
+`npx expo start` and open on a real device/Expo Go, then exercise create →
+airplane mode → edit/delete → reconnect → confirm the change lands in
+Supabase.
+
+Since it couldn't be runtime-tested, a forked review agent traced through
+`schema.ts`/`client.ts`/`local-store.ts`/`sync.ts`/`mutations.ts`/
+`queries.ts`/`AuthProvider.tsx` by hand instead. It found and — already
+fixed in this same session — two real bugs:
+1. All six `push*` functions in `sync.ts` (categories/requests/scriptures/
+   logs/plans/reminders) were hard-deleting the local tombstone row
+   **unconditionally** after firing the remote delete, even if that delete
+   call returned an error — silently losing track of a delete that never
+   actually reached Supabase (it would never retry, and the row would
+   reappear on the next pull). Fixed: now only hard-deletes locally on
+   `!error`.
+2. The local schema didn't mirror the remote's unique index on
+   `portal_categories(user_id, lower(name))`. Offline, a user could create
+   two same-named categories with no local check; the dirty row would then
+   fail *silently and permanently* every push cycle once it hit Postgres's
+   real constraint, with no error ever surfacing anywhere. Fixed two ways:
+   added a matching local partial unique index
+   (`idx_categories_user_name`, `WHERE _deleted = 0`, `COLLATE NOCASE`) so
+   the same duplicate is now caught **instantly at creation**, and wrapped
+   `createCategory`/`updateCategory` in try/catch to turn that thrown
+   SQLite constraint error into the same friendly `ActionResult` error the
+   web app's server action returns, instead of an uncaught exception.
+
+Two more things the reviewer flagged as accepted-but-worth-knowing, not
+bugs: (a) no per-row retry/backoff or UI surfacing for a push that fails for
+reasons other than a duplicate name — `getSyncState()`/`subscribeSyncState()`
+exist and are now wired to a small `SyncStatusBadge` on the Dashboard
+("Syncing…" / "Synced" / "Waiting to sync"), but there's no per-row error
+detail beyond that global indicator; (b) `AuthProvider`'s brand-new-install
++ offline case correctly can't recover an existing account's profile with
+no local data and no connectivity — it falls back to onboarding, which is
+the only sane thing it *can* do, not a bug.
+
+**None of this was verified by actually running the app** — it's a
+same-session code review of code that was never executed, which is weaker
+evidence than a real test. Treat "fixed" above as "fixed pending a real
+device test," not as verified.
 
 ## Design system
 
@@ -176,7 +290,18 @@ implementation later without touching call sites.
   RN — Postgres RLS via `owner_all` policies is what actually enforces
   ownership, same as it does for the web app's server-side Supabase client).
 
-## Verified working end-to-end (2026-07-06, via chrome-devtools against the live DB)
+## Verified working end-to-end — STALE, predates the offline-first rewrite
+
+Everything below was true and tested on 2026-07-06 **against the old
+architecture**, where every screen called Supabase directly. That data layer
+no longer exists — `queries.ts`/`mutations.ts` now read/write local SQLite
+only (see "Offline-first architecture" above), and *that* rewrite has not
+been runtime-tested at all (no device/emulator was available). The UI code
+and business logic below are unchanged, so this is still good evidence they
+work, but **the full user-visible chain (tap → SQLite → sync → Supabase) is
+unverified** — don't treat this section as current proof the app works,
+only as proof the screens worked against a different, simpler data path.
+Re-verify all of this on a real device before relying on it again.
 
 All 6 tabs are built and were exercised live against the real `fsqpjdsvlvimbshacmqt`
 project (not mocked) using a `martintest01` dev-login test account:
@@ -205,34 +330,68 @@ project (not mocked) using a `martintest01` dev-login test account:
   picker defaulting to all 7, linked-prayer-point picker) persists and
   displays correctly ("Every day · heads-up 15 min before").
 
-Not yet exercised live (would need a real device or a configured Google OAuth
-redirect): `signInWithGoogle()`, actual notification delivery (scheduling
-code runs, but firing was not observed — would need to wait real-world
-minutes/days on a device), AI scripture suggestions, voice-note recording,
-SMS reminders.
+Not yet exercised live even under the old architecture: `signInWithGoogle()`,
+actual notification delivery (scheduling code runs, but firing was not
+observed — would need to wait real-world minutes/days on a device), SMS
+reminders.
+
+## Since verified: AI suggestions + voice transcription (edge functions)
+
+The web app's `/api/portal/ai-suggestions` and `/api/portal/transcribe`
+routes only accept cookie-based auth (`lib/supabase/server.ts`'s
+`@supabase/ssr` client), which a native app can't produce. Rather than
+modify the *deployed, live* Next.js app to add Bearer-token support (real
+risk to something already serving users, for a change I couldn't test
+against its actual production deploy), two new Supabase Edge Functions were
+written instead — `supabase/functions/ai-suggestions` and
+`supabase/functions/transcribe`, deployed to the same `fsqpjdsvlvimbshacmqt`
+project, ported line-for-line from `lib/portal/groq.ts`/`transcribe.ts` +
+the route handlers' logic. `GROQ_API_KEY` is set as a function secret
+(`supabase secrets set`), never shipped in the mobile bundle. **Verified
+live**: `curl`'d the deployed `ai-suggestions` function with a real user JWT
+(signed in as `martintest01`) and got back real Groq-generated scripture
+suggestions for the "Peace during finals week" test request — see git log
+for the exact request/response. `AiSuggestionsPanel` is wired into the
+request detail screen. Voice transcription's edge function is deployed but
+its RN client call (`src/lib/portal/edge-functions.ts`'s
+`transcribeVoiceNote`) has no recording UI wired up yet — no
+`expo-av`/`expo-audio` recorder component exists in any screen.
+
+## EAS build — verified via a real cloud build
+
+`eas.json` (dev/preview/production profiles) + a linked EAS project
+(`@martin_osei/prayerbook`, id `8cae7fc4-f2af-4f37-b9a1-50fb25306923`). A
+real Android preview build was triggered and finished successfully:
+`https://expo.dev/artifacts/eas/AnxZy2dhQ9SyWbKtXvEARuZZTbOHliP0EHmvMgTWmjU.apk`
+— this is a genuinely installable APK, proof the app compiles for
+distribution, not just that it typechecks. **Built from commit `3bb3860`**,
+i.e. before the offline-first/edge-functions/icon work in this later part of
+the session — trigger a fresh build (`eas build --platform android --profile
+preview`) before relying on an artifact that includes everything above.
+Branded app icon/splash/adaptive-icon assets (dark background, gold cross,
+matching `theme/tokens.ts`) replace the create-expo-app defaults —
+`assets/images/*`.
 
 ## What's left
 
-- **Google OAuth redirect URI** needs registering in the Supabase dashboard
-  (see above) before `signInWithGoogle()` can complete — needs owner access
-  to the Supabase project, which this session didn't have.
-- **AI suggestions / voice transcription / SMS reminders** — all three live
-  behind Next.js API routes in the web app (see PORTAL_SPEC.md §5-6), not raw
-  Supabase, so they need `EXPO_PUBLIC_PORTAL_API_URL` pointed at a reachable
-  deployment of that server (currently only `localhost:3000` in dev, not
-  reachable from a phone). Request detail screen has no AI-suggestions panel
-  or voice recorder yet — scriptures can only be added manually for now.
-- **EAS build config** (`eas.json`) doesn't exist yet — needed before a real
-  device/store build. No app icons/splash beyond the create-expo-app
-  defaults — swap `assets/images/*` for real PrayerBook branding before
-  shipping.
+- **Google OAuth redirect URI** needs registering in Supabase's Auth → URL
+  Configuration. The user began authorizing the `plugin:supabase:supabase`
+  MCP server for this; check whether that completed before assuming it's
+  still blocked (see the auth section above).
+- **SMS reminders** are not wired up (would need Arkesel, and the
+  reminder-delivery cron job itself was already flagged in PORTAL_SPEC.md as
+  unconfirmed/unscheduled even in the source web app).
+- **No voice-note recording UI** — the transcribe edge function exists and
+  works, but no screen actually records audio yet.
+- **The whole offline-first rewrite needs a real device test** — see above,
+  this is the single most important open item.
 - **Confetti** is haptic-only (see `lib/portal/confetti.ts`) — a real
   particle burst would need a small canvas/SVG-based implementation (no
   direct RN equivalent to `canvas-confetti`).
 - Chart x-axis labels on Analytics' 30/90-day views are cramped (every day
   gets a tiny label) — consider showing every Nth label instead of all of
   them.
-- Test data exists in the shared `fsqpjdsvlvimbshacmqt` DB from this session's
-  verification pass: user `martintest01` / category "Academics" / request
-  "Peace during finals week" / plan "Daily peace" / reminder "Morning
-  devotion". Harmless to leave or clean up.
+- Test data exists in the shared `fsqpjdsvlvimbshacmqt` DB from this
+  session's verification pass: user `martintest01` / category "Academics" /
+  request "Peace during finals week" / plan "Daily peace" / reminder
+  "Morning devotion". Harmless to leave or clean up.

@@ -12,13 +12,14 @@ import {
 import Animated, { FadeInDown } from "react-native-reanimated";
 
 import { GlassCard } from "@/components/ui/GlassCard";
+import { SyncStatusBadge } from "@/components/ui/SyncStatusBadge";
 import { PressableScale } from "@/components/ui/PressableScale";
 import { ProgressBar } from "@/components/ui/ProgressBar";
 import { Pill } from "@/components/ui/Pill";
 import { showToast } from "@/components/ui/Toast";
 import { useAuth } from "@/lib/auth/AuthProvider";
 import { celebrateGoal, celebrateLog } from "@/lib/portal/confetti";
-import { queueLogPrayer } from "@/lib/portal/offline-queue";
+import { logPrayer } from "@/lib/portal/mutations";
 import { daysSince } from "@/lib/portal/progress";
 import { getDashboardData, type DashboardData } from "@/lib/portal/queries";
 import { colors, neglectColor, radius, spacing, typography } from "@/theme/tokens";
@@ -53,10 +54,10 @@ export default function DashboardScreen() {
     setRefreshing(false);
   }
 
-  async function handleQuickLog(requestId: string, isGoalCompletingPlan = false) {
+  function handleQuickLog(requestId: string, isGoalCompletingPlan = false) {
     if (!user) return;
     setLoggingId(requestId);
-    const result = await queueLogPrayer(user.id, { requestId });
+    const result = logPrayer(user.id, { requestId });
     setLoggingId(null);
     if ("error" in result) {
       showToast(result.error, "error");
@@ -67,7 +68,7 @@ export default function DashboardScreen() {
     } else {
       celebrateLog();
     }
-    showToast(result.queued ? "Saved offline — will sync when you're back 🙏" : "Prayer logged 🙏", "success");
+    showToast("Prayer logged 🙏", "success");
     load();
   }
 
@@ -101,7 +102,10 @@ export default function DashboardScreen() {
           <MaterialCommunityIcons name={g.icon} size={22} color={colors.gold} />
           <Text style={styles.greeting}>{g.text}</Text>
         </View>
-        <Text style={styles.username}>@{profile?.username ?? profileData?.username}</Text>
+        <View style={styles.usernameRow}>
+          <Text style={styles.username}>@{profile?.username ?? profileData?.username}</Text>
+          <SyncStatusBadge />
+        </View>
       </Animated.View>
 
       <Animated.View entering={FadeInDown.duration(400).delay(60)} style={styles.statsRow}>
@@ -329,6 +333,11 @@ const styles = StyleSheet.create({
   greeting: {
     ...typography.title,
     color: colors.text,
+  },
+  usernameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
   },
   username: {
     ...typography.body,

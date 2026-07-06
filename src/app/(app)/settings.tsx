@@ -84,7 +84,8 @@ export default function SettingsScreen() {
   }
 
   async function handleToggleReminder(reminder: Reminder) {
-    const result = await toggleReminder(reminder.id, !reminder.is_active);
+    if (!user) return;
+    const result = toggleReminder(user.id, reminder.id, !reminder.is_active);
     if ("error" in result) {
       showToast(result.error, "error");
       return;
@@ -93,7 +94,8 @@ export default function SettingsScreen() {
   }
 
   async function handleDeleteReminder(id: string) {
-    const result = await deleteReminder(id);
+    if (!user) return;
+    const result = deleteReminder(user.id, id);
     if ("error" in result) {
       showToast(result.error, "error");
       return;
@@ -366,7 +368,7 @@ function ReminderEditor({
       daysOfWeek,
       requestId,
     };
-    const result = reminder ? await updateReminder(reminder.id, input) : await createReminder(userId, input);
+    const result = reminder ? updateReminder(userId, reminder.id, input) : createReminder(userId, input);
     setSaving(false);
     if ("error" in result) {
       showToast(result.error, "error");

@@ -24,10 +24,10 @@ import {
   deleteLog,
   deleteRequest,
   deleteScripture,
+  logPrayer,
   setRequestStatus,
   updateRequest,
 } from "@/lib/portal/mutations";
-import { queueLogPrayer } from "@/lib/portal/offline-queue";
 import { AiSuggestionsPanel } from "@/components/portal/AiSuggestionsPanel";
 import { getRequestDetail, type RequestDetailData } from "@/lib/portal/queries";
 import type { RequestStatus } from "@/lib/portal/types";
@@ -50,31 +50,32 @@ export default function RequestDetailScreen() {
   const [showDelete, setShowDelete] = useState(false);
   const [showAddScripture, setShowAddScripture] = useState(false);
 
-  const load = useCallback(async () => {
-    const result = await getRequestDetail(id);
-    setData(result);
-  }, [id]);
+  const load = useCallback(() => {
+    if (!user) return;
+    setData(getRequestDetail(user.id, id));
+  }, [user, id]);
 
   useEffect(() => {
     load();
   }, [load]);
 
-  async function handleQuickLog() {
+  function handleQuickLog() {
     if (!user) return;
     setLogging(true);
-    const result = await queueLogPrayer(user.id, { requestId: id });
+    const result = logPrayer(user.id, { requestId: id });
     setLogging(false);
     if ("error" in result) {
       showToast(result.error, "error");
       return;
     }
     celebrateLog();
-    showToast(result.queued ? "Saved offline — will sync when you're back 🙏" : "Prayer logged 🙏", "success");
+    showToast("Prayer logged 🙏", "success");
     load();
   }
 
-  async function handleStatusChange(status: RequestStatus) {
-    const result = await setRequestStatus(id, status);
+  function handleStatusChange(status: RequestStatus) {
+    if (!user) return;
+    const result = setRequestStatus(user.id, id, status);
     if ("error" in result) {
       showToast(result.error, "error");
       return;
@@ -86,8 +87,9 @@ export default function RequestDetailScreen() {
     load();
   }
 
-  async function handleDelete() {
-    const result = await deleteRequest(id);
+  function handleDelete() {
+    if (!user) return;
+    const result = deleteRequest(user.id, id);
     if ("error" in result) {
       showToast(result.error, "error");
       return;
@@ -200,8 +202,9 @@ export default function RequestDetailScreen() {
                   </View>
                   <PressableScale
                     haptic="selection"
-                    onPress={async () => {
-                      await deleteLog(log.id);
+                    onPress={() => {
+                      if (!user) return;
+                      deleteLog(user.id, log.id);
                       load();
                     }}
                   >
@@ -249,8 +252,9 @@ export default function RequestDetailScreen() {
                   </View>
                   <PressableScale
                     haptic="selection"
-                    onPress={async () => {
-                      await deleteScripture(s.id);
+                    onPress={() => {
+                      if (!user) return;
+                      deleteScripture(user.id, s.id);
                       load();
                     }}
                   >
@@ -281,6 +285,7 @@ export default function RequestDetailScreen() {
         onClose={() => setShowEdit(false)}
         request={request}
         categories={categories}
+        userId={user?.id ?? ""}
         onSaved={() => {
           setShowEdit(false);
           load();
@@ -318,10 +323,10 @@ function AddScriptureForm({
   const [content, setContent] = useState("");
   const [saving, setSaving] = useState(false);
 
-  async function handleSave() {
+  function handleSave() {
     if (!content.trim()) return;
     setSaving(true);
-    const result = await addScriptures(userId, requestId, [
+    const result = addScriptures(userId, requestId, [
       { reference: reference.trim() || undefined, content: content.trim(), source: "manual" },
     ]);
     setSaving(false);
@@ -375,9 +380,9 @@ function LogDetailSheet({
     }
   }, [visible]);
 
-  async function handleSave() {
+  function handleSave() {
     setSaving(true);
-    const result = await queueLogPrayer(userId, {
+    const result = logPrayer(userId, {
       requestId,
       durationMinutes: minutes ? Number(minutes) : undefined,
       note: note.trim() || undefined,
@@ -388,7 +393,7 @@ function LogDetailSheet({
       return;
     }
     celebrateLog();
-    showToast(result.queued ? "Saved offline — will sync when you're back 🙏" : "Prayer logged 🙏", "success");
+    showToast("Prayer logged 🙏", "success");
     onSaved();
   }
 
@@ -424,12 +429,14 @@ function EditRequestSheet({
   onClose,
   request,
   categories,
+  userId,
   onSaved,
 }: {
   visible: boolean;
   onClose: () => void;
   request: RequestDetailData["request"];
   categories: RequestDetailData["categories"];
+  userId: string;
   onSaved: () => void;
 }) {
   const [categoryId, setCategoryId] = useState(request.category_id);
@@ -445,10 +452,10 @@ function EditRequestSheet({
     }
   }, [visible, request]);
 
-  async function handleSave() {
+  function handleSave() {
     if (!title.trim()) return;
     setSaving(true);
-    const result = await updateRequest(request.id, {
+    const result = updateRequest(userId, request.id, {
       categoryId,
       title: title.trim(),
       details: details.trim() || undefined,

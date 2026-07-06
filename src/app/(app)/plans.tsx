@@ -32,10 +32,10 @@ export default function PlansScreen() {
   const [editing, setEditing] = useState<PlanWithProgress | "new" | null>(null);
   const [deleting, setDeleting] = useState<PlanWithProgress | null>(null);
 
-  const load = useCallback(async () => {
-    const result = await getPlansScreenData();
-    setData(result);
-  }, []);
+  const load = useCallback(() => {
+    if (!user) return;
+    setData(getPlansScreenData(user.id));
+  }, [user]);
 
   useEffect(() => {
     load();
@@ -51,15 +51,16 @@ export default function PlansScreen() {
 
   const hasTargets = data.categories.length > 0 || data.activeRequests.length > 0;
 
-  async function handleToggle(plan: PlanWithProgress) {
-    const result = await togglePlan(plan.id, !plan.is_active);
+  function handleToggle(plan: PlanWithProgress) {
+    if (!user) return;
+    const result = togglePlan(user.id, plan.id, !plan.is_active);
     if ("error" in result) showToast(result.error, "error");
     load();
   }
 
-  async function handleDelete() {
-    if (!deleting) return;
-    const result = await deletePlan(deleting.id);
+  function handleDelete() {
+    if (!deleting || !user) return;
+    const result = deletePlan(user.id, deleting.id);
     if ("error" in result) {
       showToast(result.error, "error");
       return;
@@ -255,7 +256,7 @@ function PlanEditor({
     setDaysOfWeek((prev) => (prev.includes(day) ? prev.filter((d) => d !== day) : [...prev, day].sort()));
   }
 
-  async function handleSave() {
+  function handleSave() {
     if (!title.trim() || !targetId) return;
     setSaving(true);
     const input: PlanInput = {
@@ -268,7 +269,7 @@ function PlanEditor({
       windowStart: useWindow ? windowStart : undefined,
       windowEnd: useWindow ? windowEnd : undefined,
     };
-    const result = plan ? await updatePlan(plan.id, input) : await createPlan(userId, input);
+    const result = plan ? updatePlan(userId, plan.id, input) : createPlan(userId, input);
     setSaving(false);
     if ("error" in result) {
       showToast(result.error, "error");

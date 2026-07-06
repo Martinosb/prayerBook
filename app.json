@@ -10,7 +10,6 @@
     "newArchEnabled": true,
     "ios": {
       "bundleIdentifier": "org.ghamsu.prayerbook",
-      "icon": "./assets/expo.icon",
       "supportsTablet": true,
       "infoPlist": {
         "UIBackgroundModes": [
@@ -55,6 +54,13 @@
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
-    }
+    },
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "8cae7fc4-f2af-4f37-b9a1-50fb25306923"
+      }
+    },
+    "owner": "martin_osei"
   }
 }

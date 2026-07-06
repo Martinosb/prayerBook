@@ -28,6 +28,7 @@ import {
   updateRequest,
 } from "@/lib/portal/mutations";
 import { queueLogPrayer } from "@/lib/portal/offline-queue";
+import { AiSuggestionsPanel } from "@/components/portal/AiSuggestionsPanel";
 import { getRequestDetail, type RequestDetailData } from "@/lib/portal/queries";
 import type { RequestStatus } from "@/lib/portal/types";
 import { colors, radius, spacing, typography } from "@/theme/tokens";
@@ -260,6 +261,8 @@ export default function RequestDetailScreen() {
             </View>
           )}
         </View>
+
+        <AiSuggestionsPanel requestId={id} userId={user?.id ?? ""} onAdded={load} />
       </ScrollView>
 
       <LogDetailSheet
